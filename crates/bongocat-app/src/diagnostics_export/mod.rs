@@ -481,6 +481,7 @@ mod tests {
             motion_audio_enabled: true,
             command_shortcuts_enabled: true,
             behavior_shortcuts_enabled: true,
+            pointer_sensitivity_percent: 100,
             maximum_fps: 60,
             random_behavior: SettingsRandomBehavior::default(),
             model_settings: SettingsModelSettings::default(),
