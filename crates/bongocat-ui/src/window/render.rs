@@ -964,6 +964,37 @@ impl Render for SettingsView {
                     "settings.input_interaction.mouse.title",
                 ))
                 .items(with_search_keywords(vec![
+                    #[cfg(target_os = "linux")]
+                    SettingItem::new(
+                            bongocat_i18n::text(
+                                language.catalog_locale(),
+                                "settings.input_interaction.mouse.sensitivity.label",
+                            ),
+                            SettingField::number_input(
+                                NumberFieldOptions {
+                                    min: 1.0,
+                                    max: 400.0,
+                                    step: 5.0,
+                                },
+                                {
+                                    let view = view_entity.clone();
+                                    move |app| {
+                                        view.read(app)
+                                            .snapshot
+                                            .as_ref()
+                                            .map_or(100.0, |s| f64::from(s.pointer_sensitivity_percent))
+                                    }
+                                },
+                                {
+                                    let view = view_entity.clone();
+                                    move |value, app| {
+                                        view.update(app, |view, cx| {
+                                            view.set_pointer_sensitivity_percent_value(value, cx)
+                                        })
+                                    }
+                                },
+                            ),
+                        ),
                     SettingItem::new(
                         bongocat_i18n::text(
                             language.catalog_locale(),

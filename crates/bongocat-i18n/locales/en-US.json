@@ -45,6 +45,11 @@
       "title": "Recommend running with administrator access",
       "description": "BongoCat needs administrator access to keep receiving keyboard and mouse input when another app is running with administrator privileges.\n\nTo set it up: right-click BongoCat → Properties → Compatibility → turn on \"Run this program as an administrator\".",
       "open_program_folder": "Exit and open Settings"
+    },
+    "linux": {
+      "title": "Allow keyboard and mouse monitoring?",
+      "description": "BongoCat needs access to input devices to respond to keyboard and mouse activity in other apps. After you confirm, the system will request administrator authorization. Only the input helper receives elevated access; Settings and the model window continue to run as your user. Choose Set up later to continue without keyboard and mouse reactions.",
+      "confirm": "OK"
     }
   },
   "about": {
@@ -430,6 +435,9 @@
         "force_move": {
           "label": "Force mouse movement",
           "description": "Keep following the mouse in applications that capture the pointer, such as full-screen games."
+        },
+        "sensitivity": {
+          "label": "Mouse tracking sensitivity (%)"
         }
       },
       "keyboard": {

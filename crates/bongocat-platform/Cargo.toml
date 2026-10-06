@@ -43,6 +43,8 @@ arboard = { workspace = true, features = ["wayland-data-control"] }
 ashpd.workspace = true
 async-io.workspace = true
 evdev.workspace = true
+udev = "=0.9.3"
+zbus = { version = "=5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
 futures-util.workspace = true
 gilrs.workspace = true
 libc.workspace = true

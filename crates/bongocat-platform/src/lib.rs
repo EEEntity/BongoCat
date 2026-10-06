@@ -103,7 +103,8 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{
     LinuxInputService, current_display_bounds, display_bounds_for_window, global_window_origin,
-    hide_native_window, local_window_origin, show_native_window, system_language,
+    hide_native_window, local_window_origin, request_linux_input, run_linux_input_helper,
+    set_linux_pointer_sensitivity, show_native_window, system_language,
 };
 
 /// Let the user choose the model folder to import.

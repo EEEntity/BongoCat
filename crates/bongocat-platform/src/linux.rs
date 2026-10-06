@@ -1,3 +1,23 @@
+mod helper;
+mod pipe;
+mod protocol;
+
+static INPUT_REQUESTED: AtomicBool = AtomicBool::new(false);
+static INPUT_AUTHORIZED: AtomicBool = AtomicBool::new(false);
+static POINTER_SENSITIVITY: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(100);
+
+pub fn request_linux_input() {
+    INPUT_REQUESTED.store(true, Ordering::Release);
+}
+
+pub fn set_linux_pointer_sensitivity(percent: u16) {
+    POINTER_SENSITIVITY.store(percent, Ordering::Relaxed);
+}
+
+pub fn run_linux_input_helper() -> Result<(), Box<dyn std::error::Error>> {
+    helper::run()
+}
+
 use crate::{
     DisplayBounds, InputPermission, NativeWindowError, PlatformInputDiagnostics,
     PlatformInputError, PlatformInputServiceStatus, gilrs_gamepad::GilrsGamepad,
@@ -120,9 +140,11 @@ impl Default for VirtualCursor {
 impl VirtualCursor {
     fn apply(&mut self, x: i64, y: i64) -> bool {
         let previous = self.position;
-        self.position.x = (self.position.x + x as f64).clamp(0.0, VIRTUAL_CURSOR_CALIBRATION_WIDTH);
-        self.position.y =
-            (self.position.y + y as f64).clamp(0.0, VIRTUAL_CURSOR_CALIBRATION_HEIGHT);
+        let sensitivity = f64::from(POINTER_SENSITIVITY.load(Ordering::Relaxed)) / 100.0;
+        self.position.x =
+            (self.position.x + x as f64 * sensitivity).clamp(0.0, VIRTUAL_CURSOR_CALIBRATION_WIDTH);
+        self.position.y = (self.position.y + y as f64 * sensitivity)
+            .clamp(0.0, VIRTUAL_CURSOR_CALIBRATION_HEIGHT);
         self.position != previous
     }
 
@@ -197,8 +219,6 @@ impl LinuxInputService {
         gamepad_axis_producer: GamepadAxisProducer,
         diagnostics_producer: PlatformInputDiagnosticsProducer,
     ) -> Result<Self, PlatformInputError> {
-        let discovery = discover_devices(&HashSet::new(), &HashSet::new());
-
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let (completion_sender, completion_receiver) = mpsc::sync_channel(1);
@@ -207,7 +227,6 @@ impl LinuxInputService {
             .spawn(move || {
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     run_input_worker(
-                        discovery,
                         producer,
                         cursor_producer,
                         gamepad_axis_producer,
@@ -249,15 +268,7 @@ impl LinuxInputService {
 }
 
 pub(crate) fn evdev_input_permission() -> InputPermission {
-    let Ok(entries) = fs::read_dir(INPUT_DIRECTORY) else {
-        return InputPermission::Denied;
-    };
-    if entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| is_event_node(path))
-        .any(|path| fs::File::open(path).is_ok())
-    {
+    if INPUT_AUTHORIZED.load(Ordering::Acquire) {
         InputPermission::Granted
     } else {
         InputPermission::Denied
@@ -275,6 +286,7 @@ impl Drop for LinuxInputService {
 fn discover_devices(
     existing: &HashSet<PathBuf>,
     known_unsupported: &HashSet<PathBuf>,
+    seat: &str,
 ) -> DeviceDiscovery {
     let entries = match fs::read_dir(INPUT_DIRECTORY) {
         Ok(entries) => entries,
@@ -303,6 +315,19 @@ fn discover_devices(
         .filter(|path| !existing.contains(*path) && !known_unsupported.contains(*path))
         .cloned()
     {
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let syspath = Path::new("/sys/class/input").join(name);
+        let Ok(device) = udev::Device::from_syspath(&syspath) else {
+            continue;
+        };
+        let device_seat = device
+            .property_value("ID_SEAT")
+            .unwrap_or(std::ffi::OsStr::new("seat0"));
+        if device_seat != seat {
+            continue;
+        }
         match Device::open(&path) {
             Ok(device) if device_has_supported_controls(&device) => {
                 if device.set_nonblocking(true).is_ok() {
@@ -356,199 +381,195 @@ fn device_has_supported_controls(device: &Device) -> bool {
 }
 
 fn run_input_worker(
-    discovery: DeviceDiscovery,
     producer: InputProducer,
     cursor_producer: CursorProducer,
     gamepad_axis_producer: GamepadAxisProducer,
     diagnostics_producer: PlatformInputDiagnosticsProducer,
     stop: Arc<AtomicBool>,
 ) -> Result<PlatformInputDiagnostics, PlatformInputError> {
-    let initial_evdev_error = discovery
-        .devices
-        .is_empty()
-        .then(|| discovery_error(&discovery));
-    let mut devices = discovery.devices;
-    let mut known_unsupported = discovery.unsupported_paths;
+    use protocol::{ButtonState, InputMessage};
     let started = Instant::now();
-    let mut diagnostics = PlatformInputDiagnostics {
-        service_start_attempts: 1,
-        ..PlatformInputDiagnostics::default()
-    };
-    set_evdev_diagnostics(&mut diagnostics, initial_evdev_error);
-    let _ = diagnostics_producer.publish(diagnostics);
-    let mut next_reconciliation = Instant::now() + RECONCILIATION_INTERVAL;
-    let mut next_device_scan = Instant::now() + DEVICE_SCAN_INTERVAL;
-    let mut next_poll = Instant::now() + POLL_INTERVAL;
+    let mut diagnostics = PlatformInputDiagnostics::default();
     let mut gamepad = GilrsGamepad::new(producer.clone(), gamepad_axis_producer);
+    let mut helper: Option<pipe::InputHelper> = None;
     let mut recovery_pending = None;
-    let mut suspend_detector = SuspendDetector::new();
     let mut virtual_cursor = VirtualCursor::default();
+    let mut pressed = BTreeSet::new();
+    let mut enabled = true;
     publish_cursor(
         &cursor_producer,
         virtual_cursor.sample(monotonic(started)),
         &mut diagnostics,
     )?;
-
-    while !stop.load(Ordering::Acquire) {
-        if let Some(reason) = recovery_pending {
-            if recover_input_state(&producer, &mut gamepad, reason, &mut diagnostics, started)? {
-                recovery_pending = None;
-            } else {
-                thread::sleep(POLL_INTERVAL);
-                continue;
+    let result = (|| {
+        while !stop.load(Ordering::Acquire) {
+            if INPUT_REQUESTED.swap(false, Ordering::AcqRel) && helper.is_none() {
+                diagnostics.service_start_attempts += 1;
+                match pipe::InputHelper::start() {
+                    Ok(child) => helper = Some(child),
+                    Err(error) => set_evdev_diagnostics(&mut diagnostics, Some(error)),
+                }
             }
-        }
-        if suspend_detector.resumed() {
-            devices.clear();
-            known_unsupported.clear();
-            next_device_scan = Instant::now();
-            recovery_pending = Some(InputResetReason::Sleep);
-            continue;
-        }
-        match gamepad.drain(monotonic(started), &mut diagnostics) {
-            Ok(()) => {}
-            Err(InputPublishError::QueueFull(_)) => {
-                diagnostics.runtime_queue_overflows =
-                    diagnostics.runtime_queue_overflows.saturating_add(1);
-                recovery_pending = Some(InputResetReason::QueueOverflow);
-                continue;
-            }
-            Err(InputPublishError::RuntimeStopped(_)) => {
-                return Err(PlatformInputError::RuntimeStopped);
-            }
-        }
-        let mut removed = Vec::new();
-        let mut cursor_changed = false;
-        'devices: for (index, input_device) in devices.iter_mut().enumerate() {
-            let events = match input_device.device.fetch_events() {
-                Ok(events) => events.collect::<Vec<_>>(),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(_) => {
-                    removed.push(index);
+            if let Some(reason) = recovery_pending {
+                if recover_input_state(&producer, &mut gamepad, reason, &mut diagnostics, started)?
+                {
+                    recovery_pending = None;
+                } else {
+                    thread::sleep(POLL_INTERVAL);
                     continue;
                 }
-            };
-            for event in events {
-                match event.destructure() {
-                    EventSummary::Key(_, key, value) => {
-                        let Some(control) = linux_control(key) else {
-                            diagnostics.unmapped_keys = diagnostics.unmapped_keys.saturating_add(1);
-                            continue;
-                        };
-                        let edge = match value {
-                            0 => InputEdge::Up,
-                            1 => InputEdge::Down,
-                            _ => continue,
-                        };
-                        diagnostics.captured_edges = diagnostics.captured_edges.saturating_add(1);
-                        match producer.publish(InputEvent::Edge {
-                            control,
-                            edge,
-                            source: InputSource::Capture,
-                            at: monotonic(started),
-                        }) {
-                            Ok(_) => {
-                                diagnostics.queued_edges =
-                                    diagnostics.queued_edges.saturating_add(1);
-                            }
-                            Err(InputPublishError::QueueFull(_)) => {
-                                diagnostics.runtime_queue_overflows =
-                                    diagnostics.runtime_queue_overflows.saturating_add(1);
-                                recovery_pending = Some(InputResetReason::QueueOverflow);
-                                break 'devices;
-                            }
-                            Err(InputPublishError::RuntimeStopped(_)) => {
-                                return Err(PlatformInputError::RuntimeStopped);
-                            }
-                        }
+            }
+            if enabled {
+                match gamepad.drain(monotonic(started), &mut diagnostics) {
+                    Ok(()) => {}
+                    Err(InputPublishError::QueueFull(_)) => {
+                        diagnostics.runtime_queue_overflows += 1;
+                        recovery_pending = Some(InputResetReason::QueueOverflow);
+                        continue;
                     }
-                    EventSummary::RelativeAxis(_, axis, value) => {
-                        input_device.relative_motion.observe(axis, value);
+                    Err(InputPublishError::RuntimeStopped(_)) => {
+                        return Err(PlatformInputError::RuntimeStopped);
                     }
-                    EventSummary::Synchronization(_, SynchronizationCode::SYN_REPORT, _) => {
-                        if let Some((x, y)) = input_device.relative_motion.finish_report() {
-                            cursor_changed |= virtual_cursor.apply(x, y);
-                        }
-                    }
-                    EventSummary::Synchronization(_, SynchronizationCode::SYN_DROPPED, _) => {
-                        input_device.relative_motion.discard_report()
-                    }
-                    _ => {}
                 }
             }
-        }
-        if recovery_pending.is_some() {
-            continue;
-        }
-        if cursor_changed {
-            publish_cursor(
-                &cursor_producer,
-                virtual_cursor.sample(monotonic(started)),
-                &mut diagnostics,
-            )?;
-        }
-
-        if !removed.is_empty() {
-            for index in removed.into_iter().rev() {
-                devices.swap_remove(index);
-            }
-            recovery_pending = Some(InputResetReason::DeviceRemoved);
-            continue;
-        }
-
-        let now = Instant::now();
-        if now >= next_reconciliation {
-            match reconcile_devices(&devices, &producer, &mut diagnostics, started) {
-                Ok(()) => {}
-                Err(InputPublishError::QueueFull(_)) => {
-                    diagnostics.runtime_queue_overflows =
-                        diagnostics.runtime_queue_overflows.saturating_add(1);
-                    recovery_pending = Some(InputResetReason::QueueOverflow);
-                    continue;
-                }
-                Err(InputPublishError::RuntimeStopped(_)) => {
-                    return Err(PlatformInputError::RuntimeStopped);
+            // Drain a bounded batch so a busy device cannot starve shutdown or gamepads.
+            for _ in 0..256 {
+                let Some(child) = helper.as_mut() else {
+                    break;
+                };
+                let message = match child.read_message() {
+                    Ok(Some(message)) => message,
+                    Ok(None) => break,
+                    Err(error) => {
+                        helper = None;
+                        INPUT_AUTHORIZED.store(false, Ordering::Release);
+                        set_evdev_diagnostics(&mut diagnostics, Some(error));
+                        recovery_pending = Some(InputResetReason::ServiceRestart);
+                        enabled = true;
+                        break;
+                    }
+                };
+                INPUT_AUTHORIZED.store(true, Ordering::Release);
+                let at = monotonic(started);
+                let event = match message {
+                    InputMessage::Reset { enabled: active } => {
+                        enabled = active;
+                        recovery_pending = Some(InputResetReason::PermissionChanged);
+                        break;
+                    }
+                    InputMessage::Key { code, state } => {
+                        let control = u16::try_from(code)
+                            .ok()
+                            .and_then(|key| linux_control(KeyCode(key)));
+                        control.map(|control| {
+                            diagnostics.captured_edges += 1;
+                            InputEvent::Edge {
+                                control,
+                                edge: if state == ButtonState::Pressed {
+                                    InputEdge::Down
+                                } else {
+                                    InputEdge::Up
+                                },
+                                source: InputSource::Capture,
+                                at,
+                            }
+                        })
+                    }
+                    InputMessage::Motion { dx, dy } => {
+                        if virtual_cursor.apply(dx as i64, dy as i64) {
+                            publish_cursor(
+                                &cursor_producer,
+                                virtual_cursor.sample(at),
+                                &mut diagnostics,
+                            )?;
+                        }
+                        None
+                    }
+                    InputMessage::ReconcileStart => {
+                        pressed.clear();
+                        None
+                    }
+                    InputMessage::ReconcileKey { code } => {
+                        if let Some(control) = u16::try_from(code)
+                            .ok()
+                            .and_then(|key| linux_control(KeyCode(key)))
+                        {
+                            pressed.insert(control);
+                        }
+                        None
+                    }
+                    InputMessage::ReconcileEnd => {
+                        diagnostics.reconciliation_runs += 1;
+                        Some(InputEvent::Reconcile {
+                            pressed: std::mem::take(&mut pressed),
+                            at,
+                        })
+                    }
+                    InputMessage::Backend {
+                        available,
+                        permission_denied,
+                    } => {
+                        let error = if available {
+                            None
+                        } else if permission_denied {
+                            Some(PlatformInputError::PermissionDenied)
+                        } else {
+                            Some(PlatformInputError::BackendUnavailable)
+                        };
+                        set_evdev_diagnostics(&mut diagnostics, error);
+                        None
+                    }
+                    InputMessage::Heartbeat { enabled: active } => {
+                        enabled = active;
+                        None
+                    }
+                };
+                if let Some(event) = event {
+                    match producer.publish(event) {
+                        Ok(_) => diagnostics.queued_edges += 1,
+                        Err(InputPublishError::QueueFull(_)) => {
+                            diagnostics.runtime_queue_overflows += 1;
+                            recovery_pending = Some(InputResetReason::QueueOverflow);
+                            break;
+                        }
+                        Err(InputPublishError::RuntimeStopped(_)) => {
+                            return Err(PlatformInputError::RuntimeStopped);
+                        }
+                    }
                 }
             }
             let _ = diagnostics_producer.publish(diagnostics);
-            next_reconciliation = now + RECONCILIATION_INTERVAL;
+            thread::sleep(POLL_INTERVAL);
         }
-        if now >= next_device_scan {
-            let open_paths = devices
-                .iter()
-                .map(|device| device.path.clone())
-                .collect::<HashSet<_>>();
-            let discovery = discover_devices(&open_paths, &known_unsupported);
-            let evdev_error = (devices.is_empty() && discovery.devices.is_empty())
-                .then(|| discovery_error(&discovery));
-            devices.extend(discovery.devices);
-            if let Some(current_paths) = discovery.observed_paths {
-                known_unsupported.retain(|path| current_paths.contains(path));
+        Ok(())
+    })();
+    drop(helper);
+    INPUT_AUTHORIZED.store(false, Ordering::Release);
+    let shutdown = gamepad.shutdown();
+    diagnostics.gamepad_disconnections += shutdown.disconnected;
+    let deadline = Instant::now() + SERVICE_TIMEOUT;
+    let reset = loop {
+        match producer.recover(InputResetReason::ServiceRestart, monotonic(started)) {
+            Ok(_) | Err(InputPublishError::RuntimeStopped(_)) => break true,
+            Err(InputPublishError::QueueFull(_)) => {
+                diagnostics.runtime_queue_overflows += 1;
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                thread::sleep(POLL_INTERVAL);
             }
-            known_unsupported.extend(discovery.unsupported_paths);
-            set_evdev_diagnostics(&mut diagnostics, evdev_error);
-            next_device_scan = now + DEVICE_SCAN_INTERVAL;
         }
-        // Keep polling on a fixed cadence instead of adding the time spent
-        // draining devices and scanning /dev/input to every interval.
-        thread::sleep(next_poll.saturating_duration_since(Instant::now()));
-        let now = Instant::now();
-        next_poll += POLL_INTERVAL;
-        if next_poll <= now {
-            next_poll = now + POLL_INTERVAL;
-        }
-    }
-
-    let gamepad_shutdown = gamepad.shutdown();
-    diagnostics.gamepad_disconnections = diagnostics
-        .gamepad_disconnections
-        .saturating_add(gamepad_shutdown.disconnected);
-    let _ = producer.recover(InputResetReason::ServiceRestart, monotonic(started));
+    };
     cursor_producer.stop();
-    diagnostics.service_status = PlatformInputServiceStatus::Stopped;
-    diagnostics.clean_shutdown = gamepad_shutdown.backend_clean;
+    diagnostics.clean_shutdown = shutdown.backend_clean && reset;
+    diagnostics.service_status = if result.is_ok() {
+        PlatformInputServiceStatus::Stopped
+    } else {
+        PlatformInputServiceStatus::Failed
+    };
+    diagnostics.service_error_code = result.as_ref().err().map(|error| error.as_str());
     let _ = diagnostics_producer.publish(diagnostics);
-    Ok(diagnostics)
+    result.map(|()| diagnostics)
 }
 
 fn set_evdev_diagnostics(
@@ -569,28 +590,6 @@ fn set_evdev_diagnostics(
             diagnostics.service_error_code = Some(error.as_str());
         }
     }
-}
-
-fn reconcile_devices(
-    devices: &[InputDevice],
-    producer: &InputProducer,
-    diagnostics: &mut PlatformInputDiagnostics,
-    started: Instant,
-) -> Result<(), InputPublishError> {
-    let mut pressed = BTreeSet::new();
-    for input_device in devices {
-        let Ok(keys) = input_device.device.get_key_state() else {
-            continue;
-        };
-        pressed.extend(keys.iter().filter_map(linux_control));
-    }
-    diagnostics.reconciliation_runs = diagnostics.reconciliation_runs.saturating_add(1);
-    producer
-        .publish(InputEvent::Reconcile {
-            pressed,
-            at: monotonic(started),
-        })
-        .map(|_| ())
 }
 
 fn recover_input_state(

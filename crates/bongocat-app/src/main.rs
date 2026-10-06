@@ -273,6 +273,14 @@ const fn system_menu_start_failure_is_fatal() -> bool {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "linux")]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--input-helper")
+    {
+        return bongocat_platform::run_linux_input_helper();
+    }
+
     let run_options = match RunOptions::parse(env::args().skip(1)) {
         Ok(options) => options,
         Err(error) if error.help => {
@@ -488,6 +496,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(error) = bongocat_platform::apply_process_theme(initial_native_theme) {
             record_failure(&run_failures, format!("apply startup native theme: {error}"));
         }
+        #[cfg(target_os = "linux")]
+        bongocat_platform::set_linux_pointer_sensitivity(application.config().input.pointer_sensitivity_percent);
         let mut overlay = match ProductOverlaySession::start_with_interaction_sinks(
             runtime_client,
             input_producer,
@@ -780,6 +790,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the OS tears the dialog down with it. There is no cancellation channel for a
         // native dialog, so joining on quit would block shutdown on an unanswered
         // prompt, which is exactly the blocking behaviour this design removes.
+        #[cfg(target_os = "linux")]
+        if permission_check_enabled {
+            match ensure_settings_window(cx) {
+                Ok(settings) => {
+                    let _ = settings.update(cx, |_, window, cx| {
+                        window.defer(cx, move |window, cx| {
+                            bongocat_ui::show_linux_input_permission(
+                                initial_settings_snapshot.resolved_language,
+                                |_| bongocat_platform::request_linux_input(),
+                                window,
+                                cx,
+                            );
+                        });
+                    });
+                }
+                Err(error) => record_failure(&run_failures, error),
+            }
+        }
         if permission_check_enabled {
             #[cfg(target_os = "windows")]
             let permission_flow_quit_requested = Arc::clone(&shutdown_requested);

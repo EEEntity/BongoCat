@@ -45,6 +45,11 @@
       "title": "Recomendado executar com acesso de administrador",
       "description": "O BongoCat precisa de acesso de administrador para continuar recebendo a entrada do teclado e do mouse enquanto outro aplicativo é executado com privilégios de administrador.\n\nPara configurar: clique com o botão direito em BongoCat → Propriedades → Compatibilidade → ative \"Executar este programa como administrador\".",
       "open_program_folder": "Sair e abrir as configurações"
+    },
+    "linux": {
+      "title": "Permitir o monitoramento do teclado e mouse?",
+      "description": "O BongoCat precisa acessar os dispositivos de entrada para reagir ao teclado e mouse em outros aplicativos. Ao confirmar, o sistema solicitará autorização de administrador. Apenas o processo auxiliar de entrada recebe esse acesso; as configurações e a janela do modelo continuam como usuário comum. Configure depois para continuar sem reações de teclado e mouse.",
+      "confirm": "OK"
     }
   },
   "about": {
@@ -430,6 +435,9 @@
         "force_move": {
           "label": "Forçar movimento do mouse",
           "description": "Continua seguindo o mouse em aplicativos que capturam o ponteiro, como jogos em tela cheia."
+        },
+        "sensitivity": {
+          "label": "Sensibilidade do rastreamento do mouse (%)"
         }
       },
       "keyboard": {
